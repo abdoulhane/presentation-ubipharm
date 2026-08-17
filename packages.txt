@@ -1,0 +1,6 @@
+libreoffice
+ffmpeg
+espeak-ng
+libsndfile1
+fonts-dejavu-core
+fonts-liberation
