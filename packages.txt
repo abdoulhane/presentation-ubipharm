@@ -1,6 +1,5 @@
-libreoffice
-ffmpeg
-espeak-ng
-libsndfile1
-fonts-dejavu-core
-fonts-liberation
+streamlit>=1.40
+python-pptx>=1.0
+groq>=0.31
+edge-tts>=7.0
+PyMuPDF>=1.24
