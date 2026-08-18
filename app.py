@@ -151,7 +151,7 @@ def generate_narration(key, model, prompt):
             },
         ],
         temperature=0.3,
-        max_completion_tokens=300,
+        max_completion_tokens=1500,
         reasoning_format="hidden",
     )
 
