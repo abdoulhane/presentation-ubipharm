@@ -1,7 +1,5 @@
 streamlit>=1.40
 python-pptx>=1.0
 groq>=0.31
-kokoro
-soundfile>=0.12
-numpy>=1.26
+edge-tts>=7.0
 PyMuPDF>=1.24
