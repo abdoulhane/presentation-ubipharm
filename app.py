@@ -1,176 +1,89 @@
 
-import io
-import json
-import re
-import hashlib
-import wave
-import zipfile
-import tempfile
-import subprocess
-import shutil
-from pathlib import Path
+import asyncio, hashlib, io, re, shutil, subprocess, tempfile, zipfile
 from collections import Counter
-from typing import List, Dict
+from pathlib import Path
 
+import edge_tts
 import fitz
-import numpy as np
-import soundfile as sf
 import streamlit as st
-from pptx import Presentation
 from groq import Groq
-from kokoro import KPipeline
+from pptx import Presentation
 
-
-DEFAULT_IGNORED_PATTERNS = [
+IGNORED = [
     r"^\s*Département\s+douane\s*$",
     r"^\s*Date\s*$",
     r"^\s*Titre de la présentation.*Émetteur\s*$",
     r"^\s*\d+\s*$",
 ]
 
-TEXT_MODELS = [
-    "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-]
+EDGE_VOICES = {
+    "Denise — femme, France": "fr-FR-DeniseNeural",
+    "Henri — homme, France": "fr-FR-HenriNeural",
+    "Eloise — femme, France": "fr-FR-EloiseNeural",
+    "Remy — homme, France": "fr-FR-RemyMultilingualNeural",
+    "Vivienne — femme, France": "fr-FR-VivienneMultilingualNeural",
+}
 
+def norm(t):
+    t = t.replace("\u00a0", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
 
-def normalize_text(text: str) -> str:
-    text = text.replace("\u00a0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def cmp_norm(t):
+    return re.sub(r"\s+", " ", norm(t).lower()).strip(" .,:;-")
 
-
-def normalize_for_compare(text: str) -> str:
-    text = normalize_text(text).lower()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[“”«»\"'’]", "", text)
-    return text.strip(" .,:;-\n\t")
-
-
-def is_ignored_block(text: str, custom_ignored: List[str]) -> bool:
-    cleaned = normalize_text(text)
-    if not cleaned:
-        return True
-
-    for pattern in DEFAULT_IGNORED_PATTERNS:
-        if re.match(pattern, cleaned, flags=re.IGNORECASE):
-            return True
-
-    low = cleaned.lower()
-    for item in custom_ignored:
-        item = item.strip().lower()
-        if item and item in low:
-            return True
-
-    return False
-
-
-def extract_text_from_shape(shape) -> List[str]:
-    blocks = []
-
+def shape_text(shape):
+    out = []
     if hasattr(shape, "shapes"):
-        for subshape in shape.shapes:
-            blocks.extend(extract_text_from_shape(subshape))
-
+        for s in shape.shapes:
+            out += shape_text(s)
     if getattr(shape, "has_text_frame", False):
-        paragraphs = []
-        for p in shape.text_frame.paragraphs:
-            txt = normalize_text(p.text)
-            if txt:
-                paragraphs.append(txt)
-        if paragraphs:
-            blocks.append("\n".join(paragraphs))
-
+        txt = "\n".join(norm(p.text) for p in shape.text_frame.paragraphs if norm(p.text))
+        if txt:
+            out.append(txt)
     if getattr(shape, "has_table", False):
         rows = []
         for row in shape.table.rows:
-            values = [normalize_text(cell.text) for cell in row.cells]
-            values = [v for v in values if v]
-            if values:
-                rows.append(" | ".join(values))
+            vals = [norm(c.text) for c in row.cells if norm(c.text)]
+            if vals:
+                rows.append(" | ".join(vals))
         if rows:
-            blocks.append("\n".join(rows))
+            out.append("\n".join(rows))
+    return out
 
-    return blocks
-
-
-def extract_presentation(uploaded_file) -> List[Dict]:
-    prs = Presentation(io.BytesIO(uploaded_file.getvalue()))
+def extract_slides(pptx_bytes):
+    prs = Presentation(io.BytesIO(pptx_bytes))
     slides = []
-
-    for idx, slide in enumerate(prs.slides, start=1):
-        blocks = []
-        for shape in slide.shapes:
-            blocks.extend(extract_text_from_shape(shape))
-
-        seen = set()
-        unique_blocks = []
-        for block in blocks:
-            key = normalize_for_compare(block)
-            if key and key not in seen:
-                seen.add(key)
-                unique_blocks.append(normalize_text(block))
-
-        slides.append({
-            "number": idx,
-            "raw_blocks": unique_blocks,
-        })
-
+    for i, slide in enumerate(prs.slides, 1):
+        blocks, seen = [], set()
+        for sh in slide.shapes:
+            for b in shape_text(sh):
+                k = cmp_norm(b)
+                if k and k not in seen:
+                    seen.add(k)
+                    blocks.append(norm(b))
+        slides.append({"number": i, "raw_blocks": blocks})
     return slides
 
-
-def detect_repeated_blocks(slides: List[Dict], min_occurrences: int = 3) -> set:
-    counter = Counter()
-
-    for slide in slides:
-        keys = set()
-        for block in slide["raw_blocks"]:
-            key = normalize_for_compare(block)
-            if len(key) >= 70:
-                keys.add(key)
-        counter.update(keys)
-
-    return {key for key, count in counter.items() if count >= min_occurrences}
-
-
-def clean_slides(slides, custom_ignored, remove_repeated=True, min_occurrences=3):
-    repeated = (
-        detect_repeated_blocks(slides, min_occurrences)
-        if remove_repeated else set()
-    )
-
-    result = []
-
-    for slide in slides:
-        kept, removed = [], []
-
-        for block in slide["raw_blocks"]:
-            key = normalize_for_compare(block)
-
-            if is_ignored_block(block, custom_ignored):
-                removed.append({
-                    "text": block,
-                    "reason": "gabarit / élément ignoré",
-                })
-            elif key in repeated:
-                removed.append({
-                    "text": block,
-                    "reason": "bloc répété sur plusieurs slides",
-                })
-            else:
-                kept.append(block)
-
-        result.append({
-            **slide,
-            "clean_blocks": kept,
-            "removed_blocks": removed,
-            "clean_text": "\n\n".join(kept).strip(),
-        })
-
-    return result
-
+def clean_slides(slides, custom_ignored):
+    counts = Counter()
+    for s in slides:
+        for b in set(cmp_norm(x) for x in s["raw_blocks"] if len(cmp_norm(x)) >= 70):
+            counts[b] += 1
+    repeated = {k for k, v in counts.items() if v >= 3}
+    cleaned = []
+    for s in slides:
+        kept = []
+        for b in s["raw_blocks"]:
+            if any(re.match(p, b, re.I) for p in IGNORED):
+                continue
+            if any(x.lower() in b.lower() for x in custom_ignored if x):
+                continue
+            if cmp_norm(b) in repeated:
+                continue
+            kept.append(b)
+        cleaned.append({"number": s["number"], "clean_text": "\n\n".join(kept).strip()})
+    return cleaned
 
 def get_groq_key():
     try:
@@ -178,70 +91,40 @@ def get_groq_key():
     except Exception:
         return ""
 
-
-def build_prompt(slide, previous_narration, next_slide_text, mode, target_seconds):
-    words_min = max(35, int(target_seconds * 1.7))
-    words_max = max(words_min + 15, int(target_seconds * 2.2))
-
-    mode_instruction = {
-        "Expliquer naturellement": (
-            "Explique le contenu comme un formateur qui s'adresse oralement à des salariés. "
-            "Ne lis pas simplement les puces : relie les idées et rends le propos fluide."
-        ),
-        "Résumer": (
-            "Résume les idées essentielles de la slide de façon claire et orale. "
-            "Supprime les détails secondaires sans inventer d'information."
-        ),
-        "Lecture reformulée": (
-            "Reste très proche du contenu de la slide, mais reformule pour que cela sonne naturel à l'oral."
-        ),
-    }[mode]
-
+def narration_prompt(slide, previous, target_seconds):
     return f"""
-Tu rédiges la narration orale d'une présentation professionnelle destinée à des salariés.
+Rédige uniquement le texte oral final en français.
 
-RÈGLES IMPÉRATIVES :
-- Utilise UNIQUEMENT les informations présentes dans le contenu fourni.
-- N'invente aucun chiffre, aucune règle, aucune date, aucune sanction ni aucun fait.
-- Ne dis pas "la slide", "la diapositive" ou "comme vous pouvez le voir".
-- Ne lis pas les éléments de pied de page, numéros, dates de modèle ou mentions techniques.
-- Le français doit être naturel, simple et professionnel.
-- Évite les répétitions avec la narration précédente.
-- Une transition courte est autorisée si elle ne crée pas de nouvelle information.
-- Vise environ {words_min} à {words_max} mots.
-- Retourne UNIQUEMENT le texte à prononcer.
-- Aucun titre, aucun guillemet, aucun commentaire, aucun raisonnement.
+RÈGLES :
+- Utilise exclusivement les informations présentes dans CONTENU.
+- N'invente aucune information pour atteindre une longueur donnée.
+- Si le contenu est très court ou correspond à une page de titre,
+  une narration de 1 ou 2 phrases suffit.
+- Ne développe pas la signification d'un terme si elle n'est pas
+  explicitement donnée dans le contenu.
+- Ne dis jamais "slide" ou "diapositive".
+- Ton naturel, professionnel et simple.
+- Ne retourne aucun raisonnement, analyse, explication ou balise <think>.
+- Retourne uniquement ce qui doit être prononcé.
 
-STYLE :
-{mode_instruction}
+CONTENU :
+{slide["clean_text"]}
 
-NUMÉRO DE SLIDE :
-{slide["number"]}
+NARRATION PRÉCÉDENTE :
+{previous[-1000:] if previous else "[Aucune]"}
+"""
 
-CONTENU À EXPLIQUER :
-{slide["clean_text"] if slide["clean_text"] else "[Aucun contenu textuel exploitable]"}
+def generate_narration(key, model, prompt):
+    client = Groq(api_key=key)
 
-NARRATION DE LA SLIDE PRÉCÉDENTE :
-{previous_narration[-1200:] if previous_narration else "[Première slide]"}
-
-CONTENU DE LA SLIDE SUIVANTE :
-{next_slide_text[:1200] if next_slide_text else "[Dernière slide]"}
-
-Rédige maintenant la narration.
-""".strip()
-
-
-def generate_text(api_key: str, model: str, prompt: str) -> str:
-    client = Groq(api_key=api_key)
-
-    kwargs = {
-        "model": model,
-        "messages": [
+    r = client.chat.completions.create(
+        model=model,
+        messages=[
             {
                 "role": "system",
                 "content": (
-                    "Tu écris des narrations professionnelles en français. "
-                    "Tu respectes strictement le contenu fourni et tu n'inventes rien."
+                    "Tu rédiges uniquement le texte final à prononcer "
+                    "dans une présentation professionnelle."
                 ),
             },
             {
@@ -249,940 +132,201 @@ def generate_text(api_key: str, model: str, prompt: str) -> str:
                 "content": prompt,
             },
         ],
-        "temperature": 0.3,
-        "max_tokens": 900,
-    }
-
-    # Qwen 3.x peut exposer un mode reasoning. On lui demande explicitement
-    # de retourner uniquement la réponse utile via le prompt ci-dessus.
-    response = client.chat.completions.create(**kwargs)
-    content = response.choices[0].message.content or ""
-    return normalize_text(content)
-
-
-@st.cache_resource(show_spinner="Chargement de la voix française Kokoro…")
-def get_kokoro_pipeline():
-    # 'f' = français fr-FR dans Kokoro.
-    return KPipeline(lang_code="f")
-
-
-def kokoro_tts(text: str, speed: float = 1.0) -> bytes:
-    """
-    Synthèse locale/open-source.
-    Kokoro fournit actuellement une voix française ff_siwis.
-    """
-    pipeline = get_kokoro_pipeline()
-    generator = pipeline(
-        text,
-        voice="ff_siwis",
-        speed=speed,
-        split_pattern=r"\n+|(?<=[.!?;:])\s+",
+        temperature=0.3,
+        max_completion_tokens=300,
+        reasoning_format="hidden",
     )
 
-    chunks = []
+    return norm(r.choices[0].message.content or "")
 
-    for _graphemes, _phonemes, audio in generator:
-        arr = np.asarray(audio, dtype=np.float32)
-        if arr.size:
-            chunks.append(arr)
+async def edge_audio_async(text, voice, rate, pitch):
+    c = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+    data = bytearray()
+    async for chunk in c.stream():
+        if chunk["type"] == "audio":
+            data.extend(chunk["data"])
+    if not data:
+        raise RuntimeError("Edge TTS n'a produit aucun audio.")
+    return bytes(data)
 
-    if not chunks:
-        raise RuntimeError("Kokoro n'a produit aucun audio pour ce texte.")
+def edge_audio(text, voice, rate, pitch):
+    return asyncio.run(edge_audio_async(text, voice, rate, pitch))
 
-    # Petite pause entre les segments pour éviter un débit trop compact.
-    pause = np.zeros(int(24000 * 0.10), dtype=np.float32)
-    merged_parts = []
-
-    for i, chunk in enumerate(chunks):
-        merged_parts.append(chunk)
-        if i < len(chunks) - 1:
-            merged_parts.append(pause)
-
-    merged = np.concatenate(merged_parts)
-
-    buf = io.BytesIO()
-    sf.write(buf, merged, 24000, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-
-def pcm_to_wav_bytes(pcm: bytes, channels=1, rate=24000, sample_width=2) -> bytes:
-    buffer = io.BytesIO()
-
-    with wave.open(buffer, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(rate)
-        wf.writeframes(pcm)
-
-    return buffer.getvalue()
-
-
-def create_silent_wav(duration_seconds: float, rate: int = 24000) -> bytes:
-    duration_seconds = max(0.5, float(duration_seconds))
-    frame_count = int(duration_seconds * rate)
-    pcm = b"\x00\x00" * frame_count
-    return pcm_to_wav_bytes(pcm, channels=1, rate=rate, sample_width=2)
-
-
-def find_command(names: List[str]) -> str | None:
-    for name in names:
-        path = shutil.which(name)
-        if path:
-            return path
+def find_cmd(names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
     return None
 
-
-def render_pptx_to_pngs(pptx_bytes: bytes, workdir: Path, dpi: int = 140) -> List[Path]:
-    soffice = find_command(["libreoffice", "soffice"])
-
-    if not soffice:
-        raise RuntimeError(
-            "LibreOffice est introuvable. "
-            "Sur Streamlit Community Cloud, vérifie packages.txt."
-        )
-
-    pptx_path = workdir / "presentation.pptx"
-    pptx_path.write_bytes(pptx_bytes)
-
-    cmd = [
-        soffice,
-        "--headless",
-        "--convert-to", "pdf",
-        "--outdir", str(workdir),
-        str(pptx_path),
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=180,
-    )
-
-    pdf_path = workdir / "presentation.pdf"
-
-    if result.returncode != 0 or not pdf_path.exists():
-        raise RuntimeError(
-            "LibreOffice n'a pas réussi à convertir le PowerPoint.\n"
-            f"{result.stderr[-2000:]}"
-        )
-
-    doc = fitz.open(pdf_path)
-    png_paths = []
-
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
-
-    for index, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        out = workdir / f"slide_{index:03d}.png"
-        pix.save(out)
-        png_paths.append(out)
-
-    doc.close()
-    return png_paths
-
-
-def build_video(
-    pptx_bytes: bytes,
-    audio_by_slide: Dict[int, bytes],
-    slide_count: int,
-    silent_slide_seconds: float = 2.0,
-    resolution: str = "1280x720",
-):
-    ffmpeg = find_command(["ffmpeg"])
-
+def mp3_to_wav(mp3):
+    ffmpeg = find_cmd(["ffmpeg"])
     if not ffmpeg:
-        raise RuntimeError(
-            "FFmpeg est introuvable. "
-            "Sur Streamlit Community Cloud, vérifie packages.txt."
-        )
+        raise RuntimeError("FFmpeg introuvable.")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        a, w = td/"a.mp3", td/"a.wav"
+        a.write_bytes(mp3)
+        r = subprocess.run([ffmpeg, "-y", "-i", str(a), "-ar", "24000", "-ac", "1", str(w)],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not w.exists():
+            raise RuntimeError(r.stderr[-1500:])
+        return w.read_bytes()
 
-    width, height = [int(x) for x in resolution.split("x")]
-
-    with tempfile.TemporaryDirectory() as tmp:
-        workdir = Path(tmp)
-        pngs = render_pptx_to_pngs(pptx_bytes, workdir)
-
-        if len(pngs) != slide_count:
-            raise RuntimeError(
-                f"{slide_count} slides attendues, mais {len(pngs)} slides ont été rendues."
-            )
-
-        segment_paths = []
-
-        for index, png_path in enumerate(pngs, start=1):
-            wav_bytes = audio_by_slide.get(index)
-
-            if not wav_bytes:
-                wav_bytes = create_silent_wav(silent_slide_seconds)
-
-            wav_path = workdir / f"audio_{index:03d}.wav"
-            wav_path.write_bytes(wav_bytes)
-
-            segment_path = workdir / f"segment_{index:03d}.mp4"
-
-            vf = (
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                "setsar=1"
-            )
-
-            cmd = [
-                ffmpeg,
-                "-y",
-                "-loop", "1",
-                "-framerate", "25",
-                "-i", str(png_path),
-                "-i", str(wav_path),
-                "-vf", vf,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-tune", "stillimage",
-                "-pix_fmt", "yuv420p",
-                "-r", "25",
-                "-c:a", "aac",
-                "-b:a", "160k",
-                "-ar", "48000",
-                "-ac", "2",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(segment_path),
-            ]
-
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=240,
-            )
-
-            if result.returncode != 0 or not segment_path.exists():
-                raise RuntimeError(
-                    f"FFmpeg a échoué sur la slide {index}.\n"
-                    f"{result.stderr[-2500:]}"
-                )
-
-            segment_paths.append(segment_path)
-
-        concat_file = workdir / "concat.txt"
-        concat_file.write_text(
-            "\n".join(f"file '{p.as_posix()}'" for p in segment_paths),
-            encoding="utf-8",
-        )
-
-        final_path = workdir / "presentation_narree.mp4"
-
-        result = subprocess.run(
-            [
-                ffmpeg,
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",
-                "-movflags", "+faststart",
-                str(final_path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=240,
-        )
-
-        if result.returncode != 0 or not final_path.exists():
-            raise RuntimeError(
-                "FFmpeg n'a pas réussi à assembler la vidéo finale.\n"
-                f"{result.stderr[-3000:]}"
-            )
-
-        return (
-            final_path.read_bytes(),
-            [p.read_bytes() for p in pngs],
-        )
-
-
-def create_audio_zip(audio_by_slide: Dict[int, bytes]) -> bytes:
+def silent_wav(seconds=2):
+    import wave
     buf = io.BytesIO()
-
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for slide_num, wav_bytes in sorted(audio_by_slide.items()):
-            z.writestr(
-                f"slide_{slide_num:02d}.wav",
-                wav_bytes,
-            )
-
+    rate = 24000
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes(b"\x00\x00" * int(rate * seconds))
     return buf.getvalue()
 
+def render_slides(pptx_bytes, workdir):
+    soffice = find_cmd(["libreoffice", "soffice"])
+    if not soffice:
+        raise RuntimeError("LibreOffice introuvable.")
+    pptx = workdir/"presentation.pptx"
+    pptx.write_bytes(pptx_bytes)
+    r = subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(workdir), str(pptx)],
+                       capture_output=True, text=True, timeout=180)
+    pdf = workdir/"presentation.pdf"
+    if r.returncode != 0 or not pdf.exists():
+        raise RuntimeError("Conversion PowerPoint → PDF impossible.")
+    doc = fitz.open(pdf)
+    out = []
+    for i, page in enumerate(doc, 1):
+        pix = page.get_pixmap(matrix=fitz.Matrix(2,2), alpha=False)
+        p = workdir/f"slide_{i:03d}.png"
+        pix.save(p)
+        out.append(p)
+    doc.close()
+    return out
 
-def create_png_zip(png_bytes: List[bytes]) -> bytes:
-    buf = io.BytesIO()
+def build_video(pptx_bytes, audios, slide_count, resolution="1280x720"):
+    ffmpeg = find_cmd(["ffmpeg"])
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg introuvable.")
+    w, h = map(int, resolution.split("x"))
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        pngs = render_slides(pptx_bytes, td)
+        segs = []
+        for i, png in enumerate(pngs, 1):
+            wav = td/f"a_{i}.wav"
+            wav.write_bytes(audios.get(i, silent_wav()))
+            seg = td/f"s_{i}.mp4"
+            vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+            r = subprocess.run([ffmpeg,"-y","-loop","1","-framerate","25","-i",str(png),"-i",str(wav),
+                                "-vf",vf,"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+                                "-c:a","aac","-shortest",str(seg)],
+                               capture_output=True,text=True,timeout=240)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr[-1500:])
+            segs.append(seg)
+        concat = td/"concat.txt"
+        concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in segs), encoding="utf-8")
+        out = td/"presentation_narree.mp4"
+        r = subprocess.run([ffmpeg,"-y","-f","concat","-safe","0","-i",str(concat),"-c","copy",str(out)],
+                           capture_output=True,text=True,timeout=240)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(r.stderr[-1500:])
+        return out.read_bytes()
 
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, data in enumerate(png_bytes, start=1):
-            z.writestr(
-                f"slide_{i:02d}.png",
-                data,
-            )
-
-    return buf.getvalue()
-
-
-st.set_page_config(
-    page_title="Présentation IA — V4",
-    page_icon="🎬",
-    layout="wide",
-)
-
-st.title("🎬 Présentation IA — V4")
-st.caption(
-    "PowerPoint → Groq → Kokoro → vidéo MP4 • Gemini supprimé"
-)
+st.set_page_config(page_title="Présentation IA V5", page_icon="🎬", layout="wide")
+st.title("🎬 Présentation IA — V5")
+st.caption("Groq + Edge TTS + génération MP4")
 
 with st.sidebar:
-    st.header("Narration")
+    key = get_groq_key() or st.text_input("Clé API Groq", type="password")
+    client = Groq(api_key=key)
 
-    mode = st.selectbox(
-        "Mode",
-        [
-            "Expliquer naturellement",
-            "Résumer",
-            "Lecture reformulée",
-        ],
-    )
-
-    target_seconds = st.slider(
-        "Durée cible par slide",
-        15, 90, 40, 5,
-    )
-
-    remove_repeated = st.toggle(
-        "Supprimer les longs blocs répétés",
-        value=True,
-    )
-
-    min_occurrences = st.slider(
-        "Répétition à partir de",
-        2, 6, 3, 1,
-    )
-
-    custom_ignored_text = st.text_area(
-        "Expressions à toujours ignorer",
-        value=(
-            "Département douane\n"
-            "Titre de la présentation\n"
-            "Émetteur"
-        ),
-    )
-
-    custom_ignored = [
-        x.strip()
-        for x in custom_ignored_text.splitlines()
-        if x.strip()
+    available_models = [
+        m.id
+        for m in client.models.list().data
     ]
 
-    st.divider()
-    st.header("Groq")
-
-    groq_key = get_groq_key()
-
-    if not groq_key:
-        groq_key = st.text_input(
-            "Clé API Groq",
-            type="password",
-            help="Sur Streamlit Cloud, utilise GROQ_API_KEY dans Secrets.",
-        )
-    else:
-        st.success("Clé Groq chargée depuis Secrets")
-
-    text_model = st.selectbox(
-        "Modèle de narration",
-        TEXT_MODELS,
-        index=0,
+    model = st.selectbox(
+        "Modèle Groq",
+        available_models
     )
+    target_seconds = st.slider("Durée cible par slide", 15, 90, 40, 5)
+    ignored_text = st.text_area("Expressions à ignorer", "Département douane\nTitre de la présentation\nÉmetteur")
+    ignored = [x.strip() for x in ignored_text.splitlines() if x.strip()]
+    voice_label = st.selectbox("Voix française", list(EDGE_VOICES.keys()))
+    voice = EDGE_VOICES[voice_label]
+    rate_i = st.slider("Vitesse (%)", -30, 30, -5, 5)
+    pitch_i = st.slider("Hauteur (Hz)", -20, 20, 0, 5)
+    rate, pitch = f"{rate_i:+d}%", f"{pitch_i:+d}Hz"
+    resolution = st.selectbox("Résolution", ["1280x720", "1920x1080"])
 
-    st.divider()
-    st.header("Voix Kokoro")
-
-    st.write("🇫🇷 Voix : **ff_siwis**")
-
-    speech_speed = st.slider(
-        "Vitesse de lecture",
-        min_value=0.75,
-        max_value=1.25,
-        value=0.95,
-        step=0.05,
-    )
-
-    st.caption(
-        "Kokoro tourne directement sur le serveur : "
-        "aucune clé API n'est utilisée pour la voix."
-    )
-
-    st.divider()
-    st.header("Vidéo")
-
-    resolution = st.selectbox(
-        "Résolution",
-        ["1280x720", "1920x1080"],
-        index=0,
-    )
-
-    silent_slide_seconds = st.slider(
-        "Durée d'une slide sans audio",
-        1.0, 8.0, 2.0, 0.5,
-    )
-
-
-uploaded = st.file_uploader(
-    "Dépose ton PowerPoint ici",
-    type=["pptx"],
-)
-
-if uploaded is None:
-    st.info("Charge un fichier .pptx pour commencer.")
+uploaded = st.file_uploader("Dépose ton PowerPoint", type=["pptx"])
+if not uploaded:
     st.stop()
 
 pptx_bytes = uploaded.getvalue()
 file_hash = hashlib.md5(pptx_bytes).hexdigest()
+slides = clean_slides(extract_slides(pptx_bytes), ignored)
 
-try:
-    raw_slides = extract_presentation(uploaded)
-except Exception as exc:
-    st.error(f"Impossible de lire le PowerPoint : {exc}")
-    st.stop()
-
-slides = clean_slides(
-    raw_slides,
-    custom_ignored,
-    remove_repeated,
-    min_occurrences,
-)
-
-if st.session_state.get("ppt_hash") != file_hash:
-    st.session_state["ppt_hash"] = file_hash
+if st.session_state.get("file_hash") != file_hash:
+    st.session_state["file_hash"] = file_hash
     st.session_state["narrations"] = {}
-    st.session_state["audio"] = {}
+    st.session_state["audios"] = {}
     st.session_state["video"] = None
-    st.session_state["slide_pngs"] = []
 
-narrations = st.session_state.setdefault(
-    "narrations",
-    {},
-)
-
-audio_by_slide = st.session_state.setdefault(
-    "audio",
-    {},
-)
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Slides", len(slides))
-
-c2.metric(
-    "Narrations",
-    sum(
-        bool(narrations.get(s["number"]))
-        for s in slides
-    ),
-)
-
-c3.metric(
-    "Audios",
-    len(audio_by_slide),
-)
-
-c4.metric(
-    "Vidéo",
-    "Prête"
-    if st.session_state.get("video")
-    else "Non générée",
-)
-
-tab_content, tab_narr, tab_audio, tab_video, tab_export = st.tabs(
-    [
-        "1. Contenu",
-        "2. Narrations",
-        "3. Voix Kokoro",
-        "4. Vidéo",
-        "5. Export",
-    ]
-)
-
-
-with tab_content:
-    for slide in slides:
-        with st.expander(
-            f"Slide {slide['number']}",
-            expanded=slide["number"] <= 2,
-        ):
-            st.text_area(
-                "Texte conservé",
-                value=slide["clean_text"],
-                height=170,
-                key=f"src_{file_hash}_{slide['number']}",
-                disabled=True,
-            )
-
-            if slide["removed_blocks"]:
-                st.caption("Retiré automatiquement")
-
-                for item in slide["removed_blocks"]:
-                    preview = item["text"].replace(
-                        "\n",
-                        " ",
-                    )
-
-                    st.write(
-                        f"- {item['reason']} : "
-                        f"{preview[:220]}"
-                    )
-
-
-with tab_narr:
-    if not groq_key:
-        st.warning(
-            "Ajoute une clé Groq dans la barre latérale."
-        )
-
-    if st.button(
-        "✨ Générer toutes les narrations",
-        type="primary",
-        disabled=not groq_key,
-        use_container_width=True,
-    ):
-        progress = st.progress(0)
-        previous = ""
-
-        for i, slide in enumerate(slides):
-            next_text = (
-                slides[i + 1]["clean_text"]
-                if i + 1 < len(slides)
-                else ""
-            )
-
-            if slide["clean_text"]:
-                try:
-                    narration = generate_text(
-                        groq_key,
-                        text_model,
-                        build_prompt(
-                            slide,
-                            previous,
-                            next_text,
-                            mode,
-                            target_seconds,
-                        ),
-                    )
-
-                    narrations[
-                        slide["number"]
-                    ] = narration
-
-                    previous = narration
-
-                except Exception as exc:
-                    st.error(
-                        f"Slide {slide['number']} : "
-                        f"{exc}"
-                    )
-                    break
-
-            progress.progress(
-                (i + 1) / len(slides)
-            )
-
-        st.session_state[
-            "narrations"
-        ] = narrations
-
-        st.session_state["video"] = None
-
-        st.success(
-            "Narrations générées avec Groq."
-        )
-
-    for i, slide in enumerate(slides):
-        n = slide["number"]
-
-        st.markdown(f"### Slide {n}")
-
-        current = narrations.get(n, "")
-
-        edited = st.text_area(
-            "Narration",
-            value=current,
-            height=160,
-            key=(
-                f"edit_{file_hash}_"
-                f"{n}_{hash(current)}"
-            ),
-        )
-
-        if edited != current:
-            narrations[n] = edited
-            audio_by_slide.pop(n, None)
-            st.session_state["video"] = None
-
-        if st.button(
-            f"Régénérer la slide {n}",
-            key=f"regen_{n}",
-            disabled=not groq_key,
-        ):
-            prev = (
-                narrations.get(
-                    slides[i - 1]["number"],
-                    "",
-                )
-                if i > 0
-                else ""
-            )
-
-            next_text = (
-                slides[i + 1]["clean_text"]
-                if i + 1 < len(slides)
-                else ""
-            )
-
-            try:
-                narrations[n] = generate_text(
-                    groq_key,
-                    text_model,
-                    build_prompt(
-                        slide,
-                        prev,
-                        next_text,
-                        mode,
-                        target_seconds,
-                    ),
-                )
-
-                audio_by_slide.pop(n, None)
-
-                st.session_state[
-                    "narrations"
-                ] = narrations
-
-                st.session_state["video"] = None
-                st.rerun()
-
-            except Exception as exc:
-                st.error(str(exc))
-
-        st.divider()
-
-
-with tab_audio:
-    st.subheader(
-        "Transformer les narrations en voix"
-    )
-
-    st.info(
-        "La première génération peut être plus longue : "
-        "Streamlit doit charger le modèle Kokoro. "
-        "Les générations suivantes sont plus rapides."
-    )
-
-    if not any(narrations.values()):
-        st.info(
-            "Génère d'abord les narrations."
-        )
-
-    else:
-        if st.button(
-            "🔊 Générer tous les audios avec Kokoro",
-            type="primary",
-            use_container_width=True,
-        ):
-            progress = st.progress(0)
-
-            for i, slide in enumerate(slides):
-                n = slide["number"]
-                narration = (
-                    narrations.get(n, "").strip()
-                )
-
-                if narration:
-                    try:
-                        audio_by_slide[n] = (
-                            kokoro_tts(
-                                narration,
-                                speed=speech_speed,
-                            )
-                        )
-
-                    except Exception as exc:
-                        st.error(
-                            f"Audio slide {n} : "
-                            f"{exc}"
-                        )
-                        break
-
-                progress.progress(
-                    (i + 1) / len(slides)
-                )
-
-            st.session_state[
-                "audio"
-            ] = audio_by_slide
-
-            st.session_state["video"] = None
-
-            st.success(
-                "Audios Kokoro générés."
-            )
-
-        for slide in slides:
-            n = slide["number"]
-            narration = (
-                narrations.get(n, "").strip()
-            )
-
-            if not narration:
-                continue
-
-            st.markdown(f"### Slide {n}")
-            st.caption(narration)
-
-            if st.button(
-                f"🔊 Générer / régénérer slide {n}",
-                key=f"tts_{n}",
-            ):
-                try:
-                    with st.spinner(
-                        "Synthèse Kokoro…"
-                    ):
-                        audio_by_slide[n] = (
-                            kokoro_tts(
-                                narration,
-                                speed=speech_speed,
-                            )
-                        )
-
-                        st.session_state[
-                            "audio"
-                        ] = audio_by_slide
-
-                        st.session_state[
-                            "video"
-                        ] = None
-
-                    st.rerun()
-
-                except Exception as exc:
-                    st.error(
-                        f"Erreur Kokoro : {exc}"
-                    )
-
-            if n in audio_by_slide:
-                st.audio(
-                    audio_by_slide[n],
-                    format="audio/wav",
-                )
-
-            st.divider()
-
-
-with tab_video:
-    st.subheader(
-        "Créer la présentation vidéo"
-    )
-
-    missing_audio = [
-        s["number"]
-        for s in slides
-        if narrations.get(
-            s["number"],
-            "",
-        ).strip()
-        and s["number"]
-        not in audio_by_slide
-    ]
-
-    if missing_audio:
-        st.warning(
-            "Audio manquant pour : "
-            + ", ".join(
-                f"slide {n}"
-                for n in missing_audio
-            )
-        )
-
-    libreoffice_ok = bool(
-        find_command(
-            ["libreoffice", "soffice"]
-        )
-    )
-
-    ffmpeg_ok = bool(
-        find_command(["ffmpeg"])
-    )
-
-    d1, d2 = st.columns(2)
-
-    d1.write(
-        "✅ LibreOffice détecté"
-        if libreoffice_ok
-        else "❌ LibreOffice non détecté"
-    )
-
-    d2.write(
-        "✅ FFmpeg détecté"
-        if ffmpeg_ok
-        else "❌ FFmpeg non détecté"
-    )
-
-    if (
-        not libreoffice_ok
-        or not ffmpeg_ok
-    ):
-        st.info(
-            "Sur Streamlit Community Cloud, "
-            "packages.txt les installe automatiquement."
-        )
-
-    if st.button(
-        "🎬 Générer le MP4 final",
-        type="primary",
-        use_container_width=True,
-        disabled=not (
-            libreoffice_ok
-            and ffmpeg_ok
-        ),
-    ):
-        try:
-            with st.spinner(
-                "Création de la vidéo…"
-            ):
-                video, rendered_pngs = (
-                    build_video(
-                        pptx_bytes,
-                        audio_by_slide,
-                        len(slides),
-                        silent_slide_seconds,
-                        resolution,
-                    )
-                )
-
-                st.session_state[
-                    "video"
-                ] = video
-
-                st.session_state[
-                    "slide_pngs"
-                ] = rendered_pngs
-
-        except Exception as exc:
-            st.error(str(exc))
-
-    current_video = st.session_state.get(
-        "video"
-    )
-
-    if current_video:
-        st.success(
-            "La présentation narrée est prête."
-        )
-
-        st.video(current_video)
-
-        safe_name = re.sub(
-            r"[^A-Za-z0-9_-]+",
-            "_",
-            Path(uploaded.name).stem,
-        ).strip("_")
-
-        st.download_button(
-            "⬇️ Télécharger le MP4",
-            current_video,
-            file_name=(
-                f"{safe_name}_narree.mp4"
-            ),
-            mime="video/mp4",
-            use_container_width=True,
-        )
-
-
-with tab_export:
-    export_obj = {
-        "source_file": uploaded.name,
-        "model": text_model,
-        "tts": "Kokoro-82M / ff_siwis",
-        "slides": [
-            {
-                "slide": s["number"],
-                "source_text": s[
-                    "clean_text"
-                ],
-                "narration": narrations.get(
-                    s["number"],
-                    "",
-                ),
-            }
-            for s in slides
-        ],
-    }
-
-    json_data = json.dumps(
-        export_obj,
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    # Construction de l'export texte.\n    txt_parts = []
+narr = st.session_state["narrations"]
+audios = st.session_state["audios"]
+tabs = st.tabs(["1. Contenu", "2. Narrations", "3. Voix", "4. Vidéo"])
+
+with tabs[0]:
+    for s in slides:
+        with st.expander(f"Slide {s['number']}"):
+            st.text_area("Texte", s["clean_text"], height=140, disabled=True, key=f"src{s['number']}")
+
+with tabs[1]:
+    if st.button("✨ Générer toutes les narrations", type="primary", disabled=not key):
+        prev = ""
+        bar = st.progress(0)
+        for i, s in enumerate(slides):
+            if s["clean_text"]:
+                narr[s["number"]] = generate_narration(key, model, narration_prompt(s, prev, target_seconds))
+                prev = narr[s["number"]]
+            bar.progress((i+1)/len(slides))
+        st.session_state["narrations"] = narr
+        st.success("Narrations générées.")
     for s in slides:
         n = s["number"]
-        txt_parts.append(
-            f"SLIDE {n}\n"
-            f"{narrations.get(n, '[Aucune narration]')}"
-        )
-    txt_data = "\n\n".join(txt_parts)
+        cur = narr.get(n, "")
+        edit = st.text_area(f"Slide {n}", cur, height=130, key=f"narr{n}_{hash(cur)}")
+        if edit != cur:
+            narr[n] = edit
+            audios.pop(n, None)
+            st.session_state["video"] = None
 
-    c1, c2 = st.columns(2)
+with tabs[2]:
+    st.info("Edge TTS ne charge aucun modèle lourd en mémoire.")
+    if st.button("🔊 Générer tous les audios", type="primary"):
+        bar = st.progress(0)
+        for i, s in enumerate(slides):
+            n = s["number"]
+            text = narr.get(n, "").strip()
+            if text:
+                audios[n] = mp3_to_wav(edge_audio(text, voice, rate, pitch))
+            bar.progress((i+1)/len(slides))
+        st.session_state["audios"] = audios
+        st.success("Audios générés.")
+    for s in slides:
+        if s["number"] in audios:
+            st.audio(audios[s["number"]], format="audio/wav")
 
-    with c1:
-        st.download_button(
-            "⬇️ Narrations JSON",
-            json_data.encode("utf-8"),
-            "narrations.json",
-            "application/json",
-            use_container_width=True,
-        )
-
-    with c2:
-        st.download_button(
-            "⬇️ Narrations TXT",
-            txt_data.encode("utf-8"),
-            "narrations.txt",
-            "text/plain",
-            use_container_width=True,
-        )
-
-    if audio_by_slide:
-        st.download_button(
-            "⬇️ Tous les audios (.zip)",
-            create_audio_zip(
-                audio_by_slide
-            ),
-            "audios_slides.zip",
-            "application/zip",
-            use_container_width=True,
-        )
-
-    if st.session_state.get(
-        "slide_pngs"
-    ):
-        st.download_button(
-            "⬇️ Slides rendues (.zip)",
-            create_png_zip(
-                st.session_state[
-                    "slide_pngs"
-                ]
-            ),
-            "slides_png.zip",
-            "application/zip",
-            use_container_width=True,
-        )
+with tabs[3]:
+    libreoffice_ok = bool(find_cmd(["libreoffice", "soffice"]))
+    ffmpeg_ok = bool(find_cmd(["ffmpeg"]))
+    st.write("LibreOffice :", "✅" if libreoffice_ok else "❌")
+    st.write("FFmpeg :", "✅" if ffmpeg_ok else "❌")
+    if st.button("🎬 Générer le MP4", type="primary", disabled=not (libreoffice_ok and ffmpeg_ok)):
+        with st.spinner("Création de la vidéo…"):
+            st.session_state["video"] = build_video(pptx_bytes, audios, len(slides), resolution)
+    if st.session_state.get("video"):
+        st.video(st.session_state["video"])
+        st.download_button("⬇️ Télécharger la vidéo", st.session_state["video"], "presentation_narree.mp4", "video/mp4")
