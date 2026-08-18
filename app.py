@@ -87,7 +87,8 @@ def clean_slides(slides, custom_ignored):
 
 def get_groq_key():
     try:
-        return st.secrets["GROQ_API_KEY"]
+        key = st.secrets["GROQ_API_KEY"]
+        return str(key).strip()
     except Exception:
         return ""
 
@@ -115,8 +116,15 @@ NARRATION PRÉCÉDENTE :
 """
 
 def generate_narration(key, model, prompt):
-    client = Groq(api_key=key)
+    key = get_groq_key()
 
+    if not key:
+        st.error("La clé GROQ_API_KEY n'est pas configurée dans Streamlit Secrets.")
+        st.stop()
+
+
+    client = Groq(api_key=key)
+    
     r = client.chat.completions.create(
         model=model,
         messages=[
