@@ -94,26 +94,36 @@ def get_groq_key():
 
 def narration_prompt(slide, previous, target_seconds):
     return f"""
-Rédige uniquement le texte oral final en français.
+Tu dois transformer le contenu ci-dessous en narration orale professionnelle en français.
 
-RÈGLES :
-- Utilise exclusivement les informations présentes dans CONTENU.
-- N'invente aucune information pour atteindre une longueur donnée.
-- Si le contenu est très court ou correspond à une page de titre,
-  une narration de 1 ou 2 phrases suffit.
-- Ne développe pas la signification d'un terme si elle n'est pas
-  explicitement donnée dans le contenu.
-- Ne dis jamais "slide" ou "diapositive".
-- Ton naturel, professionnel et simple.
-- Ne retourne aucun raisonnement, analyse, explication ou balise <think>.
-- Retourne uniquement ce qui doit être prononcé.
+OBJECTIF PRINCIPAL :
+Présenter TOUTES les informations utiles présentes dans le contenu.
+Il ne s'agit PAS de résumer la slide.
+
+RÈGLES OBLIGATOIRES :
+- Ne supprime aucune idée, règle, exemple, chiffre, date, montant,
+  conséquence, sanction ou référence importante présente dans le contenu.
+- Pour une liste à puces, traite chaque élément.
+- Pour un exemple numéroté, explique toute la situation :
+  contexte, erreur commise, conséquence et sanction lorsqu'elles sont mentionnées.
+- Tu peux reformuler pour rendre le texte naturel à l'oral,
+  mais tu ne dois pas raccourcir au point de perdre de l'information.
+- N'invente absolument aucune information.
+- Ne dis jamais "slide", "diapositive" ou "comme vous pouvez le voir".
+- Ne lis pas les pieds de page ou éléments techniques.
+- Si le contenu est très court, comme une page de titre,
+  une ou deux phrases suffisent.
+- Si le contenu est long, la narration PEUT être longue.
+  La fidélité au contenu est prioritaire sur la durée.
+- Ne retourne aucun raisonnement, aucune analyse, aucune balise <think>.
+- Retourne uniquement le texte qui doit être prononcé.
 
 CONTENU :
 {slide["clean_text"]}
 
 NARRATION PRÉCÉDENTE :
 {previous[-1000:] if previous else "[Aucune]"}
-"""
+""".strip()
 
 def generate_narration(key, model, prompt):
     key = get_groq_key()
