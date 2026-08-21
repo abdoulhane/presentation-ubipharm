@@ -94,7 +94,7 @@ def get_groq_key():
 def narration_prompt(slide, previous, target_seconds):
     return f"""
 Rédige une narration orale en français pour des salariés.
-Utilise uniquement le contenu fourni. N'invente rien.
+Utilise uniquement le contenu fourni. N'invente et ne rajoute rien.
 Ton naturel, professionnel et pédagogique.
 Ne dis pas "slide" ou "diapositive".
 Évite les répétitions.
@@ -117,7 +117,7 @@ def generate_narration(key, model, prompt):
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        max_tokens=1000,
+        max_tokens=800,
     )
     return norm(r.choices[0].message.content or "")
 
@@ -237,15 +237,10 @@ st.caption("Groq + Edge TTS + génération MP4 • formats .pptx et .pptm")
 
 with st.sidebar:
     key = get_groq_key() or st.text_input("Clé API Groq", type="password")
-    client = Groq(api_key=key)
-    available_models = [
-        m.id
-        for m in client.models.list().data
-    ]
+    model = "openai/gpt-oss-safeguard-20b"
 
-    model = st.selectbox(
-        "Modèle Groq",
-        available_models
+    st.sidebar.write(
+        "Modèle de narration : openai/gpt-oss-safeguard-20b"
     )
     target_seconds = st.slider("Durée cible par slide", 15, 90, 40, 5)
     ignored_text = st.text_area("Expressions à ignorer", "Département douane\nTitre de la présentation\nÉmetteur")
