@@ -87,36 +87,19 @@ def clean_slides(slides, custom_ignored):
 
 def get_groq_key():
     try:
-        key = st.secrets["GROQ_API_KEY"]
-        return str(key).strip()
+        return st.secrets["GROQ_API_KEY"]
     except Exception:
         return ""
 
 def narration_prompt(slide, previous, target_seconds):
     return f"""
-Tu dois transformer le contenu ci-dessous en narration orale professionnelle en français.
-
-OBJECTIF PRINCIPAL :
-Présenter TOUTES les informations utiles présentes dans le contenu.
-Il ne s'agit PAS de résumer la slide.
-
-RÈGLES OBLIGATOIRES :
-- Ne supprime aucune idée, règle, exemple, chiffre, date, montant,
-  conséquence, sanction ou référence importante présente dans le contenu.
-- Pour une liste à puces, traite chaque élément.
-- Pour un exemple numéroté, explique toute la situation :
-  contexte, erreur commise, conséquence et sanction lorsqu'elles sont mentionnées.
-- Tu peux reformuler pour rendre le texte naturel à l'oral,
-  mais tu ne dois pas raccourcir au point de perdre de l'information.
-- N'invente absolument aucune information.
-- Ne dis jamais "slide", "diapositive" ou "comme vous pouvez le voir".
-- Ne lis pas les pieds de page ou éléments techniques.
-- Si le contenu est très court, comme une page de titre,
-  une ou deux phrases suffisent.
-- Si le contenu est long, la narration PEUT être longue.
-  La fidélité au contenu est prioritaire sur la durée.
-- Ne retourne aucun raisonnement, aucune analyse, aucune balise <think>.
-- Retourne uniquement le texte qui doit être prononcé.
+Rédige une narration orale en français pour des salariés.
+Utilise uniquement le contenu fourni. N'invente rien.
+Ton naturel, professionnel et pédagogique.
+Ne dis pas "slide" ou "diapositive".
+Évite les répétitions.
+Durée cible : environ {target_seconds} secondes.
+Retourne uniquement le texte à prononcer.
 
 CONTENU :
 {slide["clean_text"]}
@@ -126,35 +109,16 @@ NARRATION PRÉCÉDENTE :
 """.strip()
 
 def generate_narration(key, model, prompt):
-    key = get_groq_key()
-
-    if not key:
-        st.error("La clé GROQ_API_KEY n'est pas configurée dans Streamlit Secrets.")
-        st.stop()
-
-
     client = Groq(api_key=key)
-    
     r = client.chat.completions.create(
         model=model,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu rédiges uniquement le texte final à prononcer "
-                    "dans une présentation professionnelle."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
+            {"role": "system", "content": "Tu rédiges des narrations professionnelles fidèles aux sources."},
+            {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        max_completion_tokens=1500,
-        reasoning_format="hidden",
+        max_tokens=900,
     )
-
     return norm(r.choices[0].message.content or "")
 
 async def edge_audio_async(text, voice, rate, pitch):
@@ -200,14 +164,30 @@ def silent_wav(seconds=2):
         wf.writeframes(b"\x00\x00" * int(rate * seconds))
     return buf.getvalue()
 
-def render_slides(pptx_bytes, workdir):
+def render_slides(powerpoint_bytes, workdir, extension=".pptx"):
     soffice = find_cmd(["libreoffice", "soffice"])
     if not soffice:
         raise RuntimeError("LibreOffice introuvable.")
-    pptx = workdir/"presentation.pptx"
-    pptx.write_bytes(pptx_bytes)
-    r = subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(workdir), str(pptx)],
-                       capture_output=True, text=True, timeout=180)
+
+    extension = extension.lower()
+    if extension not in [".pptx", ".pptm"]:
+        raise RuntimeError(f"Format PowerPoint non pris en charge : {extension}")
+
+    powerpoint_file = workdir / f"presentation{extension}"
+    powerpoint_file.write_bytes(powerpoint_bytes)
+
+    r = subprocess.run(
+        [
+            soffice,
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", str(workdir),
+            str(powerpoint_file),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
     pdf = workdir/"presentation.pdf"
     if r.returncode != 0 or not pdf.exists():
         raise RuntimeError("Conversion PowerPoint → PDF impossible.")
@@ -221,14 +201,14 @@ def render_slides(pptx_bytes, workdir):
     doc.close()
     return out
 
-def build_video(pptx_bytes, audios, slide_count, resolution="1280x720"):
+def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", extension=".pptx"):
     ffmpeg = find_cmd(["ffmpeg"])
     if not ffmpeg:
         raise RuntimeError("FFmpeg introuvable.")
     w, h = map(int, resolution.split("x"))
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        pngs = render_slides(pptx_bytes, td)
+        pngs = render_slides(powerpoint_bytes, td, extension)
         segs = []
         for i, png in enumerate(pngs, 1):
             wav = td/f"a_{i}.wav"
@@ -253,21 +233,11 @@ def build_video(pptx_bytes, audios, slide_count, resolution="1280x720"):
 
 st.set_page_config(page_title="Présentation IA V5", page_icon="🎬", layout="wide")
 st.title("🎬 Présentation IA — V5")
-st.caption("Groq + Edge TTS + génération MP4")
+st.caption("Groq + Edge TTS + génération MP4 • formats .pptx et .pptm")
 
 with st.sidebar:
     key = get_groq_key() or st.text_input("Clé API Groq", type="password")
-    client = Groq(api_key=key)
-
-    available_models = [
-        m.id
-        for m in client.models.list().data
-    ]
-
-    model = st.selectbox(
-        "Modèle Groq",
-        available_models
-    )
+    model = st.selectbox("Modèle Groq", ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
     target_seconds = st.slider("Durée cible par slide", 15, 90, 40, 5)
     ignored_text = st.text_area("Expressions à ignorer", "Département douane\nTitre de la présentation\nÉmetteur")
     ignored = [x.strip() for x in ignored_text.splitlines() if x.strip()]
@@ -278,13 +248,27 @@ with st.sidebar:
     rate, pitch = f"{rate_i:+d}%", f"{pitch_i:+d}Hz"
     resolution = st.selectbox("Résolution", ["1280x720", "1920x1080"])
 
-uploaded = st.file_uploader("Dépose ton PowerPoint", type=["pptx"])
+uploaded = st.file_uploader("Dépose ton PowerPoint", type=["pptx", "pptm"])
 if not uploaded:
     st.stop()
 
-pptx_bytes = uploaded.getvalue()
-file_hash = hashlib.md5(pptx_bytes).hexdigest()
-slides = clean_slides(extract_slides(pptx_bytes), ignored)
+powerpoint_bytes = uploaded.getvalue()
+extension = Path(uploaded.name).suffix.lower()
+file_hash = hashlib.md5(powerpoint_bytes).hexdigest()
+
+if extension not in [".pptx", ".pptm"]:
+    st.error("Format non pris en charge. Utilise un fichier .pptx ou .pptm.")
+    st.stop()
+
+try:
+    slides = clean_slides(extract_slides(powerpoint_bytes), ignored)
+except Exception as exc:
+    st.error(
+        "Impossible de lire cette présentation. "
+        "Certains fichiers .pptm très particuliers peuvent poser problème.\n\n"
+        f"Détail : {exc}"
+    )
+    st.stop()
 
 if st.session_state.get("file_hash") != file_hash:
     st.session_state["file_hash"] = file_hash
@@ -344,7 +328,7 @@ with tabs[3]:
     st.write("FFmpeg :", "✅" if ffmpeg_ok else "❌")
     if st.button("🎬 Générer le MP4", type="primary", disabled=not (libreoffice_ok and ffmpeg_ok)):
         with st.spinner("Création de la vidéo…"):
-            st.session_state["video"] = build_video(pptx_bytes, audios, len(slides), resolution)
+            st.session_state["video"] = build_video(powerpoint_bytes, audios, len(slides), resolution, extension)
     if st.session_state.get("video"):
         st.video(st.session_state["video"])
         st.download_button("⬇️ Télécharger la vidéo", st.session_state["video"], "presentation_narree.mp4", "video/mp4")
