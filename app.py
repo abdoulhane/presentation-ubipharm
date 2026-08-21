@@ -93,13 +93,18 @@ def get_groq_key():
 
 def narration_prompt(slide, previous, target_seconds):
     return f"""
-Rédige une narration orale en français pour des salariés.
-Utilise uniquement le contenu fourni. N'invente et ne rajoute rien.
-Ton naturel, professionnel et pédagogique.
-Ne dis pas "slide" ou "diapositive".
-Évite les répétitions.
-Durée cible : environ {target_seconds} secondes.
-Retourne uniquement le texte à prononcer.
+    Rédige uniquement le texte oral final en français.
+    Fais une phrase d'introduction global pour la présentation
+    RÈGLES :
+    - Utilise exclusivement les informations présentes dans CONTENU.
+    - N'invente aucune information pour atteindre une longueur donnée.
+    - Si le contenu est très court ou correspond à une page de titre,
+    une narration de 1 ou 2 phrases suffit.
+    - Ne développe pas la signification d'un terme si elle n'est pas
+    explicitement donnée dans le contenu.
+    - Ne dis jamais "slide" ou "diapositive".
+    - Ton naturel, professionnel et simple.
+    - Retourne uniquement ce qui doit être prononcé.
 
 CONTENU :
 {slide["clean_text"]}
