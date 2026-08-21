@@ -117,7 +117,7 @@ def generate_narration(key, model, prompt):
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        max_tokens=800,
+        max_tokens=1000,
     )
     return norm(r.choices[0].message.content or "")
 
