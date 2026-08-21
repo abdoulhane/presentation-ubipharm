@@ -117,7 +117,7 @@ def generate_narration(key, model, prompt):
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        max_tokens=900,
+        max_tokens=1000,
     )
     return norm(r.choices[0].message.content or "")
 
@@ -237,7 +237,16 @@ st.caption("Groq + Edge TTS + génération MP4 • formats .pptx et .pptm")
 
 with st.sidebar:
     key = get_groq_key() or st.text_input("Clé API Groq", type="password")
-    model = st.selectbox("Modèle Groq", ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
+    client = Groq(api_key=key)
+    available_models = [
+        m.id
+        for m in client.models.list().data
+    ]
+
+    model = st.selectbox(
+        "Modèle Groq",
+        available_models
+    )
     target_seconds = st.slider("Durée cible par slide", 15, 90, 40, 5)
     ignored_text = st.text_area("Expressions à ignorer", "Département douane\nTitre de la présentation\nÉmetteur")
     ignored = [x.strip() for x in ignored_text.splitlines() if x.strip()]
