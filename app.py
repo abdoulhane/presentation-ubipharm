@@ -6,7 +6,7 @@ from pathlib import Path
 import edge_tts
 import fitz
 import streamlit as st
-from groq import Groq
+from openai import OpenAI
 from pptx import Presentation
 
 IGNORED = [
@@ -85,26 +85,36 @@ def clean_slides(slides, custom_ignored):
         cleaned.append({"number": s["number"], "clean_text": "\n\n".join(kept).strip()})
     return cleaned
 
-def get_groq_key():
+def get_openai_key():
     try:
-        return st.secrets["GROQ_API_KEY"]
+        return str(st.secrets["OPENAI_API_KEY"]).strip()
     except Exception:
         return ""
 
 def narration_prompt(slide, previous, target_seconds):
     return f"""
-    Rédige uniquement le texte oral final en français.
-    Fais une phrase d'introduction global pour la présentation
-    RÈGLES :
-    - Utilise exclusivement les informations présentes dans CONTENU.
-    - N'invente aucune information pour atteindre une longueur donnée.
-    - Si le contenu est très court ou correspond à une page de titre,
-    une narration de 1 ou 2 phrases suffit.
-    - Ne développe pas la signification d'un terme si elle n'est pas
-    explicitement donnée dans le contenu.
-    - Ne dis jamais "slide" ou "diapositive".
-    - Ton naturel, professionnel et simple.
-    - Retourne uniquement ce qui doit être prononcé.
+Transforme le contenu suivant en narration orale professionnelle en français.
+
+OBJECTIF :
+Présenter fidèlement TOUTES les informations utiles présentes dans le contenu.
+Il ne s'agit PAS de résumer.
+
+RÈGLES :
+- Ne supprime aucune idée importante.
+- Conserve tous les chiffres, dates, montants, références, exemples,
+  conséquences et sanctions présents dans le contenu.
+- Si le contenu contient plusieurs puces, traite chacune d'elles.
+- Pour un cas pratique, conserve le contexte, l'erreur commise,
+  les conséquences et les sanctions mentionnées.
+- Tu peux reformuler pour rendre le discours naturel à l'oral.
+- N'invente aucune information.
+- Ne complète pas avec tes connaissances générales.
+- Ne dis jamais "slide", "diapositive" ou "comme vous pouvez le voir".
+- Ne lis pas les pieds de page ou les éléments techniques.
+- Si le contenu est simplement une page de titre, reste très bref.
+- Si le contenu est dense, prends le temps nécessaire pour tout expliquer.
+- La fidélité au contenu est prioritaire sur la durée cible.
+- Retourne uniquement le texte qui doit être prononcé.
 
 CONTENU :
 {slide["clean_text"]}
@@ -113,18 +123,25 @@ NARRATION PRÉCÉDENTE :
 {previous[-1000:] if previous else "[Aucune]"}
 """.strip()
 
-def generate_narration(key, model, prompt):
-    client = Groq(api_key=key)
-    r = client.chat.completions.create(
+def generate_narration(api_key, model, prompt):
+    client = OpenAI(api_key=api_key)
+
+    response = client.responses.create(
         model=model,
-        messages=[
-            {"role": "system", "content": "Tu rédiges des narrations professionnelles fidèles aux sources."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.3,
-        max_tokens=1000,
+        instructions=(
+            "Tu rédiges uniquement le texte final destiné à être prononcé "
+            "dans une présentation professionnelle en français. "
+            "Tu dois être fidèle au contenu fourni, ne rien inventer et "
+            "ne retourner aucune analyse, aucun raisonnement et aucun commentaire."
+        ),
+        input=prompt,
+        reasoning={
+            "effort": "none"
+        },
+        max_output_tokens=1200,
     )
-    return norm(r.choices[0].message.content or "")
+
+    return norm(response.output_text or "")
 
 async def edge_audio_async(text, voice, rate, pitch):
     c = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
@@ -238,14 +255,21 @@ def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", ex
 
 st.set_page_config(page_title="Présentation IA V5", page_icon="🎬", layout="wide")
 st.title("🎬 Présentation IA — V5")
-st.caption("Groq + Edge TTS + génération MP4 • formats .pptx et .pptm")
+st.caption("OPENAI + Edge TTS + génération MP4 • formats .pptx et .pptm")
 
 with st.sidebar:
-    key = get_groq_key() or st.text_input("Clé API Groq", type="password")
-    model = "openai/gpt-oss-safeguard-20b"
+    openai_key = get_openai_key()
 
-    st.sidebar.write(
-        "Modèle de narration : openai/gpt-oss-safeguard-20b"
+    if not openai_key:
+        openai_key = st.text_input(
+            "Clé API OpenAI",
+            type="password"
+        )
+
+    model = "gpt-5.6-terra"
+
+    st.sidebar.success(
+        "Modèle de narration : GPT-5.6 Terra"
     )
     target_seconds = st.slider("Durée cible par slide", 15, 90, 40, 5)
     ignored_text = st.text_area("Expressions à ignorer", "Département douane\nTitre de la présentation\nÉmetteur")
