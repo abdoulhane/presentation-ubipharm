@@ -258,10 +258,10 @@ st.title("🎬 Présentation IA — V5")
 st.caption("OPENAI + Edge TTS + génération MP4 • formats .pptx et .pptm")
 
 with st.sidebar:
-    openai_key = get_openai_key()
+    key = get_openai_key()
 
-    if not openai_key:
-        openai_key = st.text_input(
+    if not key:
+        key = st.text_input(
             "Clé API OpenAI",
             type="password"
         )
