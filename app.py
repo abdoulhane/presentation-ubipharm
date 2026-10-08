@@ -1,5 +1,5 @@
 
-import asyncio, hashlib, io, re, shutil, subprocess, tempfile, zipfile
+import asyncio, hashlib, io, json, re, shutil, subprocess, tempfile, wave, zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -186,6 +186,171 @@ def silent_wav(seconds=2):
         wf.writeframes(b"\x00\x00" * int(rate * seconds))
     return buf.getvalue()
 
+AVATAR_POSITIONS = [
+    "À droite de la diapositive", "À gauche de la diapositive",
+    "En bas à droite", "En bas à gauche", "En haut à droite", "En haut à gauche",
+]
+
+def wav_duration(data):
+    with wave.open(io.BytesIO(data), "rb") as audio:
+        return audio.getnframes() / audio.getframerate()
+
+def audio_hash(data):
+    return hashlib.sha256(data).hexdigest()
+
+def audio_bundle(audios, narrations, slide_numbers, presentation_sha256=None):
+    """Export the exact audio used by the MP4, without generating new speech."""
+    buf = io.BytesIO()
+    manifest = {"slides": [], "slides_sans_audio": [], "presentation_sha256": presentation_sha256}
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for n in slide_numbers:
+            data = audios.get(n)
+            if not data:
+                manifest["slides_sans_audio"].append(n)
+                continue
+            filename = f"slide_{n:03d}.wav"
+            archive.writestr(filename, data)
+            archive.writestr(f"slide_{n:03d}.txt", narrations.get(n, ""))
+            manifest["slides"].append({
+                "diapositive": n, "audio": filename,
+                "duree_secondes": round(wav_duration(data), 3),
+                "sha256": audio_hash(data), "avatar_attendu": f"slide_{n:03d}.mp4",
+            })
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        archive.writestr("MODE_EMPLOI.txt", (
+            "Utilise chaque fichier WAV comme voix de l'avatar, sans regénérer la narration.\n"
+            "Exporte une vidéo d'avatar par audio, sans introduction, musique ni changement de vitesse.\n"
+            "Nomme la vidéo slide_001.mp4 pour slide_001.wav, et ainsi de suite.\n"
+            "Importe les vidéos dans l'onglet Avatar de l'application.\n"
+            "Si tu modifies un audio, regénère aussi sa vidéo d'avatar.\n"
+        ))
+    return buf.getvalue()
+
+def load_audio_bundle(data, slide_numbers, presentation_sha256):
+    """Restore only an export made for this exact PowerPoint."""
+    restored_audios, restored_narrations = {}, {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if sum(entry.file_size for entry in archive.infolist()) > 200 * 1024 * 1024:
+                raise RuntimeError("L'archive audio dépasse 200 Mo une fois décompressée.")
+            manifest = json.loads(archive.read("manifest.json"))
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("slides"), list):
+                raise ValueError("Manifeste audio invalide.")
+            if manifest.get("presentation_sha256") != presentation_sha256:
+                raise RuntimeError("Ce ZIP a été exporté pour un autre PowerPoint. Recharge la présentation correspondante.")
+            for item in manifest["slides"]:
+                n = item["diapositive"]
+                if n not in slide_numbers or n in restored_audios:
+                    raise RuntimeError("L'archive contient un numéro de diapositive invalide ou en double.")
+                wav = archive.read(f"slide_{n:03d}.wav")
+                if audio_hash(wav) != item["sha256"]:
+                    raise RuntimeError(f"L'audio de la diapositive {n} a été modifié depuis l'export.")
+                if wav_duration(wav) <= 0:
+                    raise RuntimeError(f"L'audio de la diapositive {n} est vide.")
+                restored_audios[n] = wav
+                restored_narrations[n] = archive.read(f"slide_{n:03d}.txt").decode("utf-8")
+    except (zipfile.BadZipFile, KeyError, TypeError, ValueError, UnicodeDecodeError, wave.Error, EOFError) as exc:
+        raise RuntimeError("ZIP audio invalide. Utilise l'archive téléchargée depuis l'onglet Voix.") from exc
+    if not restored_audios:
+        raise RuntimeError("Cette archive ne contient aucun audio.")
+    return restored_audios, restored_narrations
+
+def guess_avatar_slide(filename, slide_numbers):
+    match = re.fullmatch(r"(?:(?:slide|diapo|avatar)[_ -]?)?(\d+)", Path(filename).stem, re.I)
+    number = int(match.group(1)) if match else None
+    return number if number in slide_numbers else None
+
+def avatar_binding_issues(avatar_files, audios, bindings):
+    issues = []
+    for n in avatar_files:
+        if n not in audios:
+            issues.append(f"Diapositive {n} : génère son audio avant d'utiliser l'avatar.")
+        elif bindings.get(n, {}).get("audio_sha") != audio_hash(audios[n]):
+            issues.append(
+                f"Diapositive {n} : l'audio a changé depuis l'import de l'avatar. "
+                "Regénère la vidéo d'avatar avec le nouvel audio, puis remplace le fichier importé."
+            )
+    return issues
+
+def probe_avatar(path, ffprobe):
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode:
+        raise RuntimeError("Vidéo d'avatar illisible. Utilise un fichier MP4 ou WebM valide.")
+    metadata = json.loads(result.stdout)
+    videos = [s for s in metadata.get("streams", []) if s.get("codec_type") == "video"]
+    if not videos:
+        raise RuntimeError("Le fichier d'avatar ne contient pas de vidéo.")
+    duration = videos[0].get("duration") or metadata.get("format", {}).get("duration")
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        raise RuntimeError("La durée de la vidéo d'avatar est introuvable.") from None
+    if duration <= 0:
+        raise RuntimeError("La vidéo d'avatar est vide.")
+    return duration
+
+def validate_avatar_duration(path, audio_seconds, ffprobe, slide_number):
+    seconds = probe_avatar(path, ffprobe)
+    # Allow a little encoder padding, not an unrelated or truncated narration.
+    if abs(seconds - audio_seconds) > 0.5:
+        raise RuntimeError(
+            f"Diapositive {slide_number} : l'avatar dure {seconds:.2f} s et l'audio "
+            f"{audio_seconds:.2f} s. Utilise le WAV exporté correspondant, sans "
+            "introduction ni changement de vitesse (écart maximal : 0,5 s)."
+        )
+
+def avatar_filtergraph(width, height, position, width_percent):
+    if position not in AVATAR_POSITIONS:
+        raise ValueError("Position d'avatar inconnue.")
+    if not 15 <= width_percent <= 35:
+        raise ValueError("La largeur de l'avatar doit être comprise entre 15 et 35 %.")
+    margin = max(8, int(width * 0.0125))
+    avatar_width = int(width * width_percent / 100) // 2 * 2
+    beside = "de la diapositive" in position
+    panel_width = avatar_width + 2 * margin
+    slide_width = width - panel_width if beside else width
+    slide_x = panel_width if position == "À gauche de la diapositive" else 0
+    avatar_height = (height - 2 * margin) if beside else int(height * 0.42) // 2 * 2
+    if beside:
+        x = str(margin) if slide_x else f"main_w-overlay_w-{margin}"
+        y = "(main_h-overlay_h)/2"
+    else:
+        x = str(margin) if "gauche" in position else f"main_w-overlay_w-{margin}"
+        y = str(margin) if "haut" in position else f"main_h-overlay_h-{margin}"
+    return (
+        f"[0:v]scale={slide_width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:{slide_x}+({slide_width}-iw)/2:(oh-ih)/2,"
+        "setsar=1,setpts=PTS-STARTPTS[slide];"
+        f"[2:v]scale={avatar_width}:{avatar_height}:force_original_aspect_ratio=decrease,"
+        "setsar=1,setpts=PTS-STARTPTS,fps=25[avatar];"
+        f"[slide][avatar]overlay=x={x}:y={y}:eof_action=repeat:repeatlast=1[v]"
+    )
+
+def render_video_segment(ffmpeg, png, wav, segment, width, height,
+                         avatar=None, position=AVATAR_POSITIONS[0], width_percent=22):
+    seconds = wav_duration(Path(wav).read_bytes())
+    command = [ffmpeg, "-y", "-loop", "1", "-framerate", "25", "-i", str(png), "-i", str(wav)]
+    if avatar:
+        command += [
+            "-i", str(avatar), "-filter_complex_threads", "1",
+            "-filter_complex", avatar_filtergraph(width, height, position, width_percent),
+            "-map", "[v]", "-map", "1:a:0",
+        ]
+    else:
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        command += ["-vf", vf, "-map", "0:v:0", "-map", "1:a:0"]
+    command += [
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "25",
+        "-c:a", "aac", "-ar", "24000", "-ac", "1", "-t", f"{seconds:.6f}",
+        "-shortest", str(segment),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=max(240, int(seconds * 6)))
+    if result.returncode or not Path(segment).exists():
+        raise RuntimeError(result.stderr[-1500:])
+
 def render_slides(powerpoint_bytes, workdir, extension=".pptx"):
     soffice = find_cmd(["libreoffice", "soffice"])
     if not soffice:
@@ -223,27 +388,44 @@ def render_slides(powerpoint_bytes, workdir, extension=".pptx"):
     doc.close()
     return out
 
-def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", extension=".pptx"):
+def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", extension=".pptx",
+                avatar_files=None, avatar_position=AVATAR_POSITIONS[0], avatar_width_percent=22,
+                progress_callback=None):
     ffmpeg = find_cmd(["ffmpeg"])
     if not ffmpeg:
         raise RuntimeError("FFmpeg introuvable.")
+    avatar_files = avatar_files or {}
+    ffprobe = find_cmd(["ffprobe"]) if avatar_files else None
+    if avatar_files and not ffprobe:
+        raise RuntimeError("FFprobe introuvable. Il est fourni avec FFmpeg.")
     w, h = map(int, resolution.split("x"))
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
+        avatars = {}
+        for n, upload in avatar_files.items():
+            if n not in audios or not 1 <= n <= slide_count:
+                raise RuntimeError(f"Diapositive {n} : audio ou numéro de diapositive invalide.")
+            suffix = Path(upload.name).suffix.lower()
+            if suffix not in [".mp4", ".webm"]:
+                raise RuntimeError("L'avatar doit être une vidéo MP4 ou WebM.")
+            path = td / f"avatar_{n:03d}{suffix}"
+            with path.open("wb") as destination:
+                destination.write(upload.getbuffer())
+            validate_avatar_duration(path, wav_duration(audios[n]), ffprobe, n)
+            avatars[n] = path
         pngs = render_slides(powerpoint_bytes, td, extension)
+        if len(pngs) != slide_count:
+            raise RuntimeError("Le nombre de pages rendues ne correspond pas aux diapositives.")
         segs = []
         for i, png in enumerate(pngs, 1):
             wav = td/f"a_{i}.wav"
             wav.write_bytes(audios.get(i, silent_wav()))
             seg = td/f"s_{i}.mp4"
-            vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-            r = subprocess.run([ffmpeg,"-y","-loop","1","-framerate","25","-i",str(png),"-i",str(wav),
-                                "-vf",vf,"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
-                                "-c:a","aac","-shortest",str(seg)],
-                               capture_output=True,text=True,timeout=240)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr[-1500:])
+            render_video_segment(ffmpeg, png, wav, seg, w, h, avatars.get(i),
+                                 avatar_position, avatar_width_percent)
             segs.append(seg)
+            if progress_callback:
+                progress_callback(i, len(pngs))
         concat = td/"concat.txt"
         concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in segs), encoding="utf-8")
         out = td/"presentation_narree.mp4"
@@ -253,9 +435,9 @@ def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", ex
             raise RuntimeError(r.stderr[-1500:])
         return out.read_bytes()
 
-st.set_page_config(page_title="Présentation IA V5", page_icon="🎬", layout="wide")
-st.title("🎬 Présentation IA — V5")
-st.caption("OPENAI + Edge TTS + génération MP4 • formats .pptx et .pptm")
+st.set_page_config(page_title="Présentation IA V6", page_icon="🎬", layout="wide")
+st.title("🎬 Présentation IA — V6")
+st.caption("OPENAI + Edge TTS + génération MP4 • avatar vidéo facultatif • formats .pptx et .pptm")
 
 with st.sidebar:
     key = get_openai_key()
@@ -308,10 +490,14 @@ if st.session_state.get("file_hash") != file_hash:
     st.session_state["narrations"] = {}
     st.session_state["audios"] = {}
     st.session_state["video"] = None
+    st.session_state["avatar_bindings"] = {}
+    st.session_state["audio_export"] = None
+    st.session_state["audio_export_fingerprint"] = None
+    st.session_state["video_fingerprint"] = None
 
 narr = st.session_state["narrations"]
 audios = st.session_state["audios"]
-tabs = st.tabs(["1. Contenu", "2. Narrations", "3. Voix", "4. Vidéo"])
+tabs = st.tabs(["1. Contenu", "2. Narrations", "3. Voix", "4. Avatar", "5. Vidéo"])
 
 with tabs[0]:
     for s in slides:
@@ -320,6 +506,8 @@ with tabs[0]:
 
 with tabs[1]:
     if st.button("✨ Générer toutes les narrations", type="primary", disabled=not key):
+        audios.clear()
+        st.session_state["video"] = None
         prev = ""
         bar = st.progress(0)
         for i, s in enumerate(slides):
@@ -340,7 +528,24 @@ with tabs[1]:
 
 with tabs[2]:
     st.info("Edge TTS ne charge aucun modèle lourd en mémoire.")
+    with st.expander("Reprendre les audios sauvegardés"):
+        saved_audio_zip = st.file_uploader("ZIP audio exporté depuis cette application", type=["zip"],
+                                           key=f"audio_restore_{file_hash}")
+        if st.button("Restaurer les audios et les narrations", disabled=saved_audio_zip is None):
+            try:
+                restored_audios, restored_narrations = load_audio_bundle(
+                    saved_audio_zip.getvalue(), [s["number"] for s in slides],
+                    hashlib.sha256(powerpoint_bytes).hexdigest(),
+                )
+                audios.clear(); audios.update(restored_audios)
+                narr.clear(); narr.update(restored_narrations)
+                st.session_state["video"] = None
+                st.session_state["audio_export_fingerprint"] = None
+                st.rerun()
+            except RuntimeError as exc:
+                st.error(str(exc))
     if st.button("🔊 Générer tous les audios", type="primary"):
+        st.session_state["video"] = None
         bar = st.progress(0)
         for i, s in enumerate(slides):
             n = s["number"]
@@ -350,18 +555,103 @@ with tabs[2]:
             bar.progress((i+1)/len(slides))
         st.session_state["audios"] = audios
         st.success("Audios générés.")
+    if audios:
+        export_fingerprint = tuple((n, audio_hash(data), narr.get(n, "")) for n, data in sorted(audios.items()))
+        if st.session_state.get("audio_export_fingerprint") != export_fingerprint:
+            st.session_state["audio_export"] = audio_bundle(
+                audios, narr, [s["number"] for s in slides], hashlib.sha256(powerpoint_bytes).hexdigest(),
+            )
+            st.session_state["audio_export_fingerprint"] = export_fingerprint
+        st.download_button("⬇️ Télécharger les audios pour l'avatar (ZIP)",
+                           st.session_state["audio_export"], "audios_presentation.zip", "application/zip")
+        st.caption("Le ZIP contient les WAV exacts, les narrations et les durées par diapositive.")
     for s in slides:
         if s["number"] in audios:
+            st.write(f"Diapositive {s['number']}")
             st.audio(audios[s["number"]], format="audio/wav")
 
+avatar_files, avatar_issues = {}, []
+avatar_position, avatar_width_percent = AVATAR_POSITIONS[0], 22
 with tabs[3]:
+    use_avatars = st.checkbox("Ajouter un avatar à la vidéo", key=f"use_avatars_{file_hash}")
+    if use_avatars:
+        st.info("Utilise les WAV de l'onglet Voix pour créer une vidéo d'avatar par diapositive. "
+                "Importe ensuite ces vidéos ici, sans modifier leur vitesse ou ajouter une introduction.")
+        avatar_position = st.selectbox("Position de l'avatar", AVATAR_POSITIONS,
+                                       key=f"avatar_position_{file_hash}")
+        avatar_width_percent = st.slider("Largeur maximale de l'avatar (%)", 15, 35, 22,
+                                         key=f"avatar_width_{file_hash}")
+        st.caption("À droite ou à gauche : un espace est réservé à l'avatar pour garder tout le texte visible. "
+                   "Dans un coin : l'avatar se superpose à la diapositive.")
+        uploads = st.file_uploader("Vidéos d'avatar (MP4 ou WebM)", type=["mp4", "webm"],
+                                   accept_multiple_files=True, key=f"avatar_uploads_{file_hash}")
+        st.caption("Nomme les fichiers slide_001.mp4, slide_002.mp4… pour les associer automatiquement.")
+        slide_numbers = [s["number"] for s in slides]
+        bindings = st.session_state.setdefault("avatar_bindings", {})
+        options = [None] + slide_numbers
+        for index, upload in enumerate(uploads):
+            clip_sha = hashlib.sha256(upload.getbuffer()).hexdigest()
+            guessed = guess_avatar_slide(upload.name, slide_numbers)
+            n = st.selectbox(f"Diapositive correspondant à {upload.name}", options,
+                             index=options.index(guessed),
+                             format_func=lambda x: "À associer" if x is None else f"Diapositive {x}",
+                             key=f"avatar_slide_{file_hash}_{index}_{clip_sha}")
+            if n is None:
+                avatar_issues.append(f"Associe {upload.name} à une diapositive, ou retire ce fichier.")
+                continue
+            if n in avatar_files:
+                avatar_issues.append(f"Deux vidéos sont associées à la diapositive {n}. Garde-en une seule.")
+                continue
+            avatar_files[n] = upload
+            binding = bindings.get(n, {})
+            if binding.get("clip_sha") != clip_sha and n in audios:
+                bindings[n] = {"clip_sha": clip_sha, "audio_sha": audio_hash(audios[n])}
+        avatar_issues.extend(avatar_binding_issues(avatar_files, audios, bindings))
+        if not avatar_files:
+            avatar_issues.append("Importe au moins une vidéo d'avatar pour activer cette option.")
+        for issue in avatar_issues:
+            st.error(issue)
+        if avatar_files and not avatar_issues:
+            st.success(f"Avatar associé à {len(avatar_files)} diapositive(s) sur {len(slides)}.")
+            if len(avatar_files) < len(slides):
+                st.caption("Les autres diapositives seront générées sans avatar.")
+            with st.expander("Prévisualiser un avatar"):
+                preview_n = st.selectbox("Diapositive à prévisualiser", sorted(avatar_files),
+                                          key=f"avatar_preview_{file_hash}")
+                st.video(avatar_files[preview_n].getvalue())
+        st.caption("Si tu changes une narration ou sa voix, regénère l'audio et sa vidéo d'avatar.")
+
+with tabs[4]:
     libreoffice_ok = bool(find_cmd(["libreoffice", "soffice"]))
     ffmpeg_ok = bool(find_cmd(["ffmpeg"]))
+    ffprobe_ok = bool(find_cmd(["ffprobe"]))
     st.write("LibreOffice :", "✅" if libreoffice_ok else "❌")
     st.write("FFmpeg :", "✅" if ffmpeg_ok else "❌")
-    if st.button("🎬 Générer le MP4", type="primary", disabled=not (libreoffice_ok and ffmpeg_ok)):
-        with st.spinner("Création de la vidéo…"):
-            st.session_state["video"] = build_video(powerpoint_bytes, audios, len(slides), resolution, extension)
+    if use_avatars:
+        st.write("FFprobe :", "✅" if ffprobe_ok else "❌")
+    video_fingerprint = (
+        file_hash, resolution, tuple((n, audio_hash(data)) for n, data in sorted(audios.items())),
+        use_avatars, avatar_position, avatar_width_percent,
+        tuple((n, hashlib.sha256(upload.getbuffer()).hexdigest()) for n, upload in sorted(avatar_files.items())),
+    )
+    if st.session_state.get("video_fingerprint") != video_fingerprint:
+        st.session_state["video"] = None
+    can_build = libreoffice_ok and ffmpeg_ok and (not use_avatars or (ffprobe_ok and not avatar_issues))
+    if st.button("🎬 Générer le MP4", type="primary", disabled=not can_build):
+        try:
+            bar = st.progress(0)
+            with st.spinner("Création de la vidéo…"):
+                st.session_state["video"] = build_video(
+                    powerpoint_bytes, audios, len(slides), resolution, extension,
+                    avatar_files=avatar_files if use_avatars else None,
+                    avatar_position=avatar_position, avatar_width_percent=avatar_width_percent,
+                    progress_callback=lambda current, total: bar.progress(current / total),
+                )
+            st.session_state["video_fingerprint"] = video_fingerprint
+            st.success("Vidéo générée.")
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            st.session_state["video"] = None
+            st.error(f"La vidéo n'a pas pu être générée : {exc}")
     if st.session_state.get("video"):
         st.video(st.session_state["video"])
         st.download_button("⬇️ Télécharger la vidéo", st.session_state["video"], "presentation_narree.mp4", "video/mp4")
