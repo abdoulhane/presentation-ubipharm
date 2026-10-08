@@ -198,6 +198,42 @@ def wav_duration(data):
 def audio_hash(data):
     return hashlib.sha256(data).hexdigest()
 
+def presentation_audio_signature(audios, slide_numbers):
+    return tuple((n, audio_hash(audios[n]) if n in audios else "silence-2s") for n in slide_numbers)
+
+def presentation_audio(audios, slide_numbers):
+    output = io.BytesIO()
+    timeline, frames = [], 0
+    with wave.open(output, "wb") as destination:
+        destination.setnchannels(1); destination.setsampwidth(2); destination.setframerate(24000)
+        for n in slide_numbers:
+            data = audios[n] if n in audios else silent_wav()
+            with wave.open(io.BytesIO(data), "rb") as source:
+                if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, 24000):
+                    raise RuntimeError("Utilise les WAV générés ou restaurés par cette application.")
+                count = source.getnframes()
+                pcm = source.readframes(count)
+                if len(pcm) != count * 2:
+                    raise RuntimeError(f"L'audio de la diapositive {n} est incomplet.")
+                timeline.append({"number": n, "start": frames / 24000, "duration": count / 24000})
+                destination.writeframesraw(pcm)
+                frames += count
+    return output.getvalue(), timeline
+
+def complete_audio_mp3(audios, slide_numbers):
+    ffmpeg = find_cmd(["ffmpeg"])
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg introuvable.")
+    data, timeline = presentation_audio(audios, slide_numbers)
+    with tempfile.TemporaryDirectory() as td:
+        wav, mp3 = Path(td)/"complete.wav", Path(td)/"complete.mp3"
+        wav.write_bytes(data)
+        result = subprocess.run([ffmpeg, "-y", "-i", str(wav), "-codec:a", "libmp3lame",
+                                 "-b:a", "96k", str(mp3)], capture_output=True, text=True, timeout=240)
+        if result.returncode or not mp3.exists():
+            raise RuntimeError(result.stderr[-1500:])
+        return mp3.read_bytes(), sum(row["duration"] for row in timeline)
+
 def audio_bundle(audios, narrations, slide_numbers, presentation_sha256=None):
     """Export the exact audio used by the MP4, without generating new speech."""
     buf = io.BytesIO()
@@ -330,10 +366,12 @@ def avatar_filtergraph(width, height, position, width_percent):
     )
 
 def render_video_segment(ffmpeg, png, wav, segment, width, height,
-                         avatar=None, position=AVATAR_POSITIONS[0], width_percent=22):
+                         avatar=None, position=AVATAR_POSITIONS[0], width_percent=22, avatar_start=None):
     seconds = wav_duration(Path(wav).read_bytes())
     command = [ffmpeg, "-y", "-loop", "1", "-framerate", "25", "-i", str(png), "-i", str(wav)]
     if avatar:
+        if avatar_start is not None:
+            command += ["-ss", f"{avatar_start:.6f}"]
         command += [
             "-i", str(avatar), "-filter_complex_threads", "1",
             "-filter_complex", avatar_filtergraph(width, height, position, width_percent),
@@ -390,18 +428,35 @@ def render_slides(powerpoint_bytes, workdir, extension=".pptx"):
 
 def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", extension=".pptx",
                 avatar_files=None, avatar_position=AVATAR_POSITIONS[0], avatar_width_percent=22,
-                progress_callback=None):
+                progress_callback=None, full_avatar=None):
     ffmpeg = find_cmd(["ffmpeg"])
     if not ffmpeg:
         raise RuntimeError("FFmpeg introuvable.")
     avatar_files = avatar_files or {}
-    ffprobe = find_cmd(["ffprobe"]) if avatar_files else None
-    if avatar_files and not ffprobe:
+    if full_avatar and avatar_files:
+        raise RuntimeError("Choisis une vidéo complète ou des vidéos par diapositive.")
+    ffprobe = find_cmd(["ffprobe"]) if avatar_files or full_avatar else None
+    if (avatar_files or full_avatar) and not ffprobe:
         raise RuntimeError("FFprobe introuvable. Il est fourni avec FFmpeg.")
     w, h = map(int, resolution.split("x"))
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         avatars = {}
+        complete_avatar, timeline = None, []
+        if full_avatar:
+            suffix = Path(full_avatar.name).suffix.lower()
+            if suffix not in [".mp4", ".webm"]:
+                raise RuntimeError("L'avatar doit être une vidéo MP4 ou WebM.")
+            complete_avatar = td / f"avatar_complete{suffix}"
+            with complete_avatar.open("wb") as destination:
+                destination.write(full_avatar.getbuffer())
+            # The same durations and silences as the exported complete narration.
+            starts, elapsed = [], 0.0
+            for n in range(1, slide_count + 1):
+                seconds = wav_duration(audios[n]) if n in audios else 2.0
+                starts.append(elapsed); elapsed += seconds
+            timeline = starts
+            validate_avatar_duration(complete_avatar, elapsed, ffprobe, "présentation complète")
         for n, upload in avatar_files.items():
             if n not in audios or not 1 <= n <= slide_count:
                 raise RuntimeError(f"Diapositive {n} : audio ou numéro de diapositive invalide.")
@@ -421,8 +476,9 @@ def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", ex
             wav = td/f"a_{i}.wav"
             wav.write_bytes(audios.get(i, silent_wav()))
             seg = td/f"s_{i}.mp4"
-            render_video_segment(ffmpeg, png, wav, seg, w, h, avatars.get(i),
-                                 avatar_position, avatar_width_percent)
+            render_video_segment(ffmpeg, png, wav, seg, w, h, complete_avatar or avatars.get(i),
+                                 avatar_position, avatar_width_percent,
+                                 timeline[i-1] if complete_avatar else None)
             segs.append(seg)
             if progress_callback:
                 progress_callback(i, len(pngs))
@@ -435,8 +491,8 @@ def build_video(powerpoint_bytes, audios, slide_count, resolution="1280x720", ex
             raise RuntimeError(r.stderr[-1500:])
         return out.read_bytes()
 
-st.set_page_config(page_title="Présentation IA V6", page_icon="🎬", layout="wide")
-st.title("🎬 Présentation IA — V6")
+st.set_page_config(page_title="Présentation IA V7", page_icon="🎬", layout="wide")
+st.title("🎬 Présentation IA — V7")
 st.caption("OPENAI + Edge TTS + génération MP4 • avatar vidéo facultatif • formats .pptx et .pptm")
 
 with st.sidebar:
@@ -494,6 +550,9 @@ if st.session_state.get("file_hash") != file_hash:
     st.session_state["audio_export"] = None
     st.session_state["audio_export_fingerprint"] = None
     st.session_state["video_fingerprint"] = None
+    st.session_state["complete_audio_mp3"] = None
+    st.session_state["complete_audio_signature"] = None
+    st.session_state["full_avatar_binding"] = {}
 
 narr = st.session_state["narrations"]
 audios = st.session_state["audios"]
@@ -556,6 +615,28 @@ with tabs[2]:
         st.session_state["audios"] = audios
         st.success("Audios générés.")
     if audios:
+        all_numbers = [s["number"] for s in slides]
+        complete_signature = presentation_audio_signature(audios, all_numbers)
+        if st.session_state.get("complete_audio_signature") != complete_signature:
+            st.session_state["complete_audio_mp3"] = None
+        missing_audio = [s["number"] for s in slides if s["clean_text"] and s["number"] not in audios]
+        if st.button("Préparer l'audio complet pour une seule vidéo d'avatar", disabled=bool(missing_audio)):
+            try:
+                with st.spinner("Assemblage des audios…"):
+                    mp3, total = complete_audio_mp3(audios, all_numbers)
+                st.session_state["complete_audio_mp3"] = mp3
+                st.session_state["complete_audio_duration"] = total
+                st.session_state["complete_audio_signature"] = complete_signature
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                st.error(str(exc))
+        if missing_audio:
+            st.caption("Génère d'abord les audios de toutes les diapositives à lire.")
+        if st.session_state.get("complete_audio_mp3"):
+            st.download_button("⬇️ Télécharger la narration complète (MP3)",
+                               st.session_state["complete_audio_mp3"], "presentation_complete.mp3", "audio/mpeg")
+            total = st.session_state["complete_audio_duration"]
+            st.caption(f"Durée totale : {int(total//60)} min {int(total%60)} s. "
+                       "Importe ce MP3 dans le service d'avatar pour créer une seule vidéo complète.")
         export_fingerprint = tuple((n, audio_hash(data), narr.get(n, "")) for n, data in sorted(audios.items()))
         if st.session_state.get("audio_export_fingerprint") != export_fingerprint:
             st.session_state["audio_export"] = audio_bundle(
@@ -571,55 +652,84 @@ with tabs[2]:
             st.audio(audios[s["number"]], format="audio/wav")
 
 avatar_files, avatar_issues = {}, []
+full_avatar, full_avatar_sha = None, None
 avatar_position, avatar_width_percent = AVATAR_POSITIONS[0], 22
 with tabs[3]:
     use_avatars = st.checkbox("Ajouter un avatar à la vidéo", key=f"use_avatars_{file_hash}")
     if use_avatars:
-        st.info("Utilise les WAV de l'onglet Voix pour créer une vidéo d'avatar par diapositive. "
-                "Importe ensuite ces vidéos ici, sans modifier leur vitesse ou ajouter une introduction.")
+        st.info("Pour économiser le nombre de vidéos, utilise la narration complète MP3 de l’onglet Voix. "
+                "Crée une seule vidéo d’avatar avec ce MP3, puis importe-la ici.")
         avatar_position = st.selectbox("Position de l'avatar", AVATAR_POSITIONS,
                                        key=f"avatar_position_{file_hash}")
         avatar_width_percent = st.slider("Largeur maximale de l'avatar (%)", 15, 35, 22,
                                          key=f"avatar_width_{file_hash}")
         st.caption("À droite ou à gauche : un espace est réservé à l'avatar pour garder tout le texte visible. "
                    "Dans un coin : l'avatar se superpose à la diapositive.")
-        uploads = st.file_uploader("Vidéos d'avatar (MP4 ou WebM)", type=["mp4", "webm"],
-                                   accept_multiple_files=True, key=f"avatar_uploads_{file_hash}")
-        st.caption("Nomme les fichiers slide_001.mp4, slide_002.mp4… pour les associer automatiquement.")
-        slide_numbers = [s["number"] for s in slides]
-        bindings = st.session_state.setdefault("avatar_bindings", {})
-        options = [None] + slide_numbers
-        for index, upload in enumerate(uploads):
-            clip_sha = hashlib.sha256(upload.getbuffer()).hexdigest()
-            guessed = guess_avatar_slide(upload.name, slide_numbers)
-            n = st.selectbox(f"Diapositive correspondant à {upload.name}", options,
-                             index=options.index(guessed),
-                             format_func=lambda x: "À associer" if x is None else f"Diapositive {x}",
-                             key=f"avatar_slide_{file_hash}_{index}_{clip_sha}")
-            if n is None:
-                avatar_issues.append(f"Associe {upload.name} à une diapositive, ou retire ce fichier.")
-                continue
-            if n in avatar_files:
-                avatar_issues.append(f"Deux vidéos sont associées à la diapositive {n}. Garde-en une seule.")
-                continue
-            avatar_files[n] = upload
-            binding = bindings.get(n, {})
-            if binding.get("clip_sha") != clip_sha and n in audios:
-                bindings[n] = {"clip_sha": clip_sha, "audio_sha": audio_hash(audios[n])}
-        avatar_issues.extend(avatar_binding_issues(avatar_files, audios, bindings))
-        if not avatar_files:
-            avatar_issues.append("Importe au moins une vidéo d'avatar pour activer cette option.")
-        for issue in avatar_issues:
-            st.error(issue)
-        if avatar_files and not avatar_issues:
-            st.success(f"Avatar associé à {len(avatar_files)} diapositive(s) sur {len(slides)}.")
-            if len(avatar_files) < len(slides):
-                st.caption("Les autres diapositives seront générées sans avatar.")
-            with st.expander("Prévisualiser un avatar"):
-                preview_n = st.selectbox("Diapositive à prévisualiser", sorted(avatar_files),
-                                          key=f"avatar_preview_{file_hash}")
-                st.video(avatar_files[preview_n].getvalue())
-        st.caption("Si tu changes une narration ou sa voix, regénère l'audio et sa vidéo d'avatar.")
+        avatar_mode = st.radio("Import des avatars", ["Une seule vidéo pour toute la présentation", "Une vidéo par diapositive"],
+                               key=f"avatar_mode_{file_hash}")
+        if avatar_mode == "Une seule vidéo pour toute la présentation":
+            full_avatar = st.file_uploader("Vidéo d'avatar complète (MP4 ou WebM)", type=["mp4", "webm"],
+                                            key=f"full_avatar_upload_{file_hash}")
+            st.caption("L'application découpe cette vidéo selon les durées exactes des audios. "
+                       "Le service d'avatar doit autoriser une vidéo de cette durée ; regrouper les audios ne change pas ses quotas de minutes.")
+            if full_avatar is None:
+                avatar_issues.append("Importe la vidéo d'avatar créée avec la narration complète.")
+            else:
+                full_avatar_sha = hashlib.sha256(full_avatar.getbuffer()).hexdigest()
+                signature = presentation_audio_signature(audios, [s["number"] for s in slides])
+                binding = st.session_state.get("full_avatar_binding", {})
+                audio_ready = bool(audios) and not any(s["clean_text"] and s["number"] not in audios for s in slides)
+                if binding.get("clip_sha") != full_avatar_sha and audio_ready:
+                    st.session_state["full_avatar_binding"] = {"clip_sha": full_avatar_sha, "audio_signature": signature}
+                elif binding.get("clip_sha") == full_avatar_sha and binding.get("audio_signature") != signature:
+                    avatar_issues.append("Les audios ont changé depuis l'import de l'avatar complet. "
+                                         "Regénère cette vidéo avec la nouvelle narration complète.")
+                if not audio_ready:
+                    avatar_issues.append("Génère ou restaure d'abord les audios de la présentation.")
+                if not avatar_issues:
+                    st.success("Vidéo complète importée. Le découpage par diapositive sera automatique.")
+                    with st.expander("Prévisualiser l'avatar complet"):
+                        st.video(full_avatar.getvalue())
+            for issue in avatar_issues:
+                st.error(issue)
+        else:
+            uploads = st.file_uploader("Vidéos d'avatar (MP4 ou WebM)", type=["mp4", "webm"],
+                                       accept_multiple_files=True, key=f"avatar_uploads_{file_hash}")
+            st.caption("Nomme les fichiers slide_001.mp4, slide_002.mp4… pour les associer automatiquement.")
+            slide_numbers = [s["number"] for s in slides]
+            bindings = st.session_state.setdefault("avatar_bindings", {})
+            options = [None] + slide_numbers
+            for index, upload in enumerate(uploads):
+                clip_sha = hashlib.sha256(upload.getbuffer()).hexdigest()
+                guessed = guess_avatar_slide(upload.name, slide_numbers)
+                n = st.selectbox(f"Diapositive correspondant à {upload.name}", options,
+                                 index=options.index(guessed),
+                                 format_func=lambda x: "À associer" if x is None else f"Diapositive {x}",
+                                 key=f"avatar_slide_{file_hash}_{index}_{clip_sha}")
+                if n is None:
+                    avatar_issues.append(f"Associe {upload.name} à une diapositive, ou retire ce fichier.")
+                    continue
+                if n in avatar_files:
+                    avatar_issues.append(f"Deux vidéos sont associées à la diapositive {n}. Garde-en une seule.")
+                    continue
+                avatar_files[n] = upload
+                binding = bindings.get(n, {})
+                if binding.get("clip_sha") != clip_sha and n in audios:
+                    bindings[n] = {"clip_sha": clip_sha, "audio_sha": audio_hash(audios[n])}
+            avatar_issues.extend(avatar_binding_issues(avatar_files, audios, bindings))
+            if not avatar_files:
+                avatar_issues.append("Importe au moins une vidéo d'avatar pour activer cette option.")
+            for issue in avatar_issues:
+                st.error(issue)
+            if avatar_files and not avatar_issues:
+                st.success(f"Avatar associé à {len(avatar_files)} diapositive(s) sur {len(slides)}.")
+                if len(avatar_files) < len(slides):
+                    st.caption("Les autres diapositives seront générées sans avatar.")
+                with st.expander("Prévisualiser un avatar"):
+                    preview_n = st.selectbox("Diapositive à prévisualiser", sorted(avatar_files),
+                                              key=f"avatar_preview_{file_hash}")
+                    st.video(avatar_files[preview_n].getvalue())
+            st.caption("Si tu changes une narration ou sa voix, regénère l'audio et sa vidéo d'avatar.")
 
 with tabs[4]:
     libreoffice_ok = bool(find_cmd(["libreoffice", "soffice"]))
@@ -633,6 +743,7 @@ with tabs[4]:
         file_hash, resolution, tuple((n, audio_hash(data)) for n, data in sorted(audios.items())),
         use_avatars, avatar_position, avatar_width_percent,
         tuple((n, hashlib.sha256(upload.getbuffer()).hexdigest()) for n, upload in sorted(avatar_files.items())),
+        full_avatar_sha,
     )
     if st.session_state.get("video_fingerprint") != video_fingerprint:
         st.session_state["video"] = None
@@ -646,6 +757,7 @@ with tabs[4]:
                     avatar_files=avatar_files if use_avatars else None,
                     avatar_position=avatar_position, avatar_width_percent=avatar_width_percent,
                     progress_callback=lambda current, total: bar.progress(current / total),
+                    full_avatar=full_avatar if use_avatars else None,
                 )
             st.session_state["video_fingerprint"] = video_fingerprint
             st.success("Vidéo générée.")
